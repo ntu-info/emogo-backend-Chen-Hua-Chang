@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.binary import Binary
 from bson.objectid import ObjectId
+from bson.json_util import dumps # 用來處理 MongoDB 的特殊格式
 import os
 import io
+import json
 
 app = FastAPI()
 
@@ -30,7 +32,7 @@ async def shutdown_db_client():
     if db_client:
         db_client.close()
 
-# --- API 區域 (上傳邏輯保持不變) ---
+# --- API 區域 ---
 
 @app.get("/")
 async def read_root():
@@ -53,7 +55,6 @@ async def upload_vlog(
     file: UploadFile = File(...), 
     slot: str = Form(...), 
     mood: int = Form(...),
-    # 接收前端傳來的關聯 ID (這很重要，用來把資料串起來)
     scale_id: str = Form(...) 
 ):
     if db is None: raise HTTPException(status_code=500, detail="DB not connected")
@@ -63,7 +64,7 @@ async def upload_vlog(
             "filename": file.filename,
             "slot": slot,
             "mood": mood,
-            "scale_id": scale_id, # 存入關聯 ID
+            "scale_id": scale_id,
             "data": Binary(file_content)
         }
         result = await db["vlogs"].insert_one(vlog_data)
@@ -71,27 +72,24 @@ async def upload_vlog(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 關鍵修改：下載/檢視頁面 (整合顯示) ---
+# --- 下載/檢視頁面 (已加入 JSON 匯出按鈕) ---
 
 @app.get("/data", response_class=HTMLResponse)
 async def view_data():
     if db is None: return "<h1>Error: DB not connected</h1>"
     
-    # 1. 先撈出所有的「心情 (Sentiments)」作為主軸
-    # 因為心情是每次紀錄的核心
+    # 撈出資料
     sentiments = await db["sentiments"].find().sort("timestamp", -1).to_list(100)
     
     table_rows = ""
     
     for s in sentiments:
-        # 取得這筆心情的基本資料
         s_id = str(s["_id"])
         timestamp = s.get("timestamp", "Unknown Time")
         slot = s.get("slot", "N/A")
         score = s.get("score", "N/A")
         
-        # 2. 去找這筆心情對應的 GPS 資料
-        # (前端在存心情時，有把 gps_id 存進去)
+        # 關聯 GPS
         gps_info = "無 GPS 資料"
         if "gps_id" in s:
             try:
@@ -103,19 +101,17 @@ async def view_data():
             except:
                 gps_info = "GPS ID 格式錯誤"
 
-        # 3. 去找這筆心情對應的 Vlog 資料
-        # (前端在存 Vlog 時，有把 scale_id (即 sentiment id) 存進去)
-        # 我們用 scale_id 來反查
+        # 關聯 Vlog
         vlog_info = "無影片"
         vlog_data = await db["vlogs"].find_one({"scale_id": s_id})
         
         if vlog_data:
             v_filename = vlog_data.get("filename", "video.mp4")
             v_id = str(vlog_data["_id"])
+            # 影片本來就是檔案，保留個別下載連結
             download_link = f"/download/vlog/{v_id}"
             vlog_info = f"<a href='{download_link}' style='color: blue; text-decoration: underline;'>下載 {v_filename}</a>"
 
-        # 4. 組合成表格的一列
         table_rows += f"""
         <tr style="border-bottom: 1px solid #ddd;">
             <td style="padding: 10px;">{timestamp}</td>
@@ -126,19 +122,27 @@ async def view_data():
         </tr>
         """
 
-    # 5. 輸出漂亮的 HTML 表格
     html_content = f"""
     <html>
         <head>
             <title>EmoGo Integrated Data</title>
             <style>
-                table {{ border-collapse: collapse; width: 100%; }}
+                table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
                 th {{ background-color: #f2f2f2; padding: 10px; text-align: left; }}
                 tr:hover {{ background-color: #f5f5f5; }}
+                .btn {{
+                    background-color: #4CAF50; color: white; padding: 10px 20px;
+                    text-decoration: none; border-radius: 5px; font-size: 16px;
+                }}
+                .btn:hover {{ background-color: #45a049; }}
             </style>
         </head>
         <body style="font-family: Arial; padding: 20px;">
-            <h1>EmoGo 使用者紀錄總表</h1>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h1>EmoGo 使用者紀錄總表</h1>
+                <a href="/download_all_data" class="btn" target="_blank">📥 匯出所有資料 (JSON)</a>
+            </div>
+            
             <p>這裡整合顯示了每一次紀錄的完整資訊 (時間、心情、GPS、影片)。</p>
             
             <table border="1">
@@ -159,6 +163,29 @@ async def view_data():
     </html>
     """
     return html_content
+
+# --- 新增：打包下載所有文字資料 (JSON) ---
+@app.get("/download_all_data")
+async def download_all_json():
+    if db is None: raise HTTPException(status_code=500, detail="DB not connected")
+    
+    # 撈取所有文字型資料 (排除影片 binary 內容以免檔案太大)
+    sentiments = await db["sentiments"].find({}, {"_id": 0}).to_list(1000)
+    gps_data = await db["gps"].find({}, {"_id": 0}).to_list(1000)
+    # Vlog 只撈 metadata (檔名、關聯ID)，不撈 content
+    vlogs_meta = await db["vlogs"].find({}, {"_id": 0, "data": 0}).to_list(1000)
+
+    export_data = {
+        "sentiments": sentiments,
+        "gps_coordinates": gps_data,
+        "vlogs_metadata": vlogs_meta
+    }
+    
+    # 回傳可下載的 JSON 檔案
+    return JSONResponse(
+        content=json.loads(dumps(export_data)), # 使用 dumps 處理 ObjectId 等特殊格式
+        headers={"Content-Disposition": "attachment; filename=emogo_full_data.json"}
+    )
 
 # E. 影片下載 (保持不變)
 @app.get("/download/vlog/{vlog_id}")
