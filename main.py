@@ -1,14 +1,14 @@
-from typing import Optional
-
 from fastapi import FastAPI
 
+# 1. 初始化 APP
 app = FastAPI()
 
-
+# 2. 定義一個根目錄 (首頁)
 @app.get("/")
-async def root():
-    return {"message": "Hello World"}
+def read_root():
+    return {"message": "Hello! EmoGo Backend is successfully running on Render!"}
 
-@app.get("/items/{item_id}")
-def read_item(item_id: int, q: Optional[str] = None):
-    return {"item_id": item_id, "q": q}
+# 3. 定義一個簡單的測試頁面
+@app.get("/test")
+def read_test():
+    return {"status": "ok", "detail": "This is a test endpoint without database."}
