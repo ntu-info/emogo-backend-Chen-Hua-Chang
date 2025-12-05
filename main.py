@@ -7,6 +7,7 @@ from bson.json_util import dumps
 import os
 import io
 import json
+import csv # [New] 引入 CSV 模組
 
 app = FastAPI()
 
@@ -38,7 +39,7 @@ async def shutdown_db_client():
 async def read_root():
     return {"message": "EmoGo Backend is running!"}
 
-# --- 舊有的分開上傳接口 (保留以備不時之需) ---
+# --- 舊有的分開上傳接口 (保留) ---
 @app.post("/upload/sentiment")
 async def upload_sentiment(data: dict):
     if db is None: raise HTTPException(status_code=500, detail="DB not connected")
@@ -74,8 +75,8 @@ async def upload_vlog(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- 🔥 新增：大一統上傳接口 (One-Shot Upload) ---
-# 這個接口專門給 App 背景上傳使用，一次接收所有欄位
+# --- 🔥 大一統上傳接口 (One-Shot Upload) ---
+# 保持你原本的簡易儲存邏輯 (不使用 GridFS)，確保相容性
 @app.post("/upload/full_record")
 async def upload_full_record(
     file: UploadFile = File(...),
@@ -86,39 +87,35 @@ async def upload_full_record(
     timestamp: str = Form(...),
     duration: str = Form(None)
 ):
-    """
-    一次接收 GPS、心情、影片，並在後端自動拆解儲存。
-    這樣前端只需要發送一次請求，避免背景執行時斷線。
-    """
     if db is None: raise HTTPException(status_code=500, detail="DB not connected")
     
     try:
-        # 1. 先存 GPS 資料
+        # 1. 存 GPS
         gps_doc = {
             "latitude": latitude,
             "longitude": longitude,
             "timestamp": timestamp
         }
         gps_result = await db["gps"].insert_one(gps_doc)
-        gps_id = str(gps_result.inserted_id) # 拿到 GPS ID
+        gps_id = str(gps_result.inserted_id) 
 
-        # 2. 再存 心情 (Sentiment) 資料，並關聯 GPS ID
+        # 2. 存 心情
         sentiment_doc = {
-            "score": mood_score, # 注意：資料庫顯示用 "score"
+            "score": mood_score,
             "slot": slot,
             "timestamp": timestamp,
             "gps_id": gps_id
         }
         sentiment_result = await db["sentiments"].insert_one(sentiment_doc)
-        scale_id = str(sentiment_result.inserted_id) # 拿到心情 ID (即 scale_id)
+        scale_id = str(sentiment_result.inserted_id) 
 
-        # 3. 最後存 影片 (Vlog) 資料，並關聯 scale_id
+        # 3. 存 影片 (維持一般的 Binary 儲存)
         file_content = await file.read()
         vlog_doc = {
             "filename": file.filename,
             "slot": slot,
             "mood": mood_score,
-            "scale_id": scale_id, # 這裡做關聯
+            "scale_id": scale_id, 
             "duration": duration,
             "data": Binary(file_content),
             "timestamp": timestamp
@@ -133,15 +130,13 @@ async def upload_full_record(
         raise HTTPException(status_code=500, detail=f"Full upload failed: {str(e)}")
 
 
-# --- 下載/檢視頁面 (保持不變) ---
+# --- 下載/檢視頁面 ---
 
 @app.get("/data", response_class=HTMLResponse)
 async def view_data():
     if db is None: return "<h1>Error: DB not connected</h1>"
     
-    # 撈出資料
     sentiments = await db["sentiments"].find().sort("timestamp", -1).to_list(100)
-    
     table_rows = ""
     
     for s in sentiments:
@@ -185,62 +180,104 @@ async def view_data():
     html_content = f"""
     <html>
         <head>
-            <title>EmoGo Integrated Data</title>
+            <title>EmoGo Data</title>
             <style>
                 table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
                 th {{ background-color: #f2f2f2; padding: 10px; text-align: left; }}
                 tr:hover {{ background-color: #f5f5f5; }}
-                .btn {{
-                    background-color: #4CAF50; color: white; padding: 10px 20px;
-                    text-decoration: none; border-radius: 5px; font-size: 16px;
-                }}
-                .btn:hover {{ background-color: #45a049; }}
+                .btn {{ background-color: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; }}
             </style>
         </head>
         <body style="font-family: Arial; padding: 20px;">
             <div style="display: flex; justify-content: space-between; align-items: center;">
                 <h1>EmoGo 使用者紀錄總表</h1>
-                <a href="/download_all_data" class="btn" target="_blank">📥 匯出所有資料 (JSON)</a>
+                <a href="/download_all_data" class="btn" target="_blank">📥 匯出 Excel (CSV)</a>
             </div>
             
             <p>這裡整合顯示了每一次紀錄的完整資訊 (時間、心情、GPS、影片)。</p>
             
             <table border="1">
                 <thead>
-                    <tr>
-                        <th>時間 (Time)</th>
-                        <th>時段 (Slot)</th>
-                        <th>心情 (Mood)</th>
-                        <th>位置 (GPS)</th>
-                        <th>影片 (Vlog)</th>
-                    </tr>
+                    <tr><th>時間 (Time)</th><th>時段 (Slot)</th><th>心情 (Mood)</th><th>位置 (GPS)</th><th>影片 (Vlog)</th></tr>
                 </thead>
-                <tbody>
-                    {table_rows}
-                </tbody>
+                <tbody>{table_rows}</tbody>
             </table>
         </body>
     </html>
     """
     return html_content
 
+# --- 🔥 修改：匯出 CSV 功能 (針對你的簡易資料庫結構) ---
 @app.get("/download_all_data")
-async def download_all_json():
+async def download_all_csv():
     if db is None: raise HTTPException(status_code=500, detail="DB not connected")
     
-    sentiments = await db["sentiments"].find({}, {"_id": 0}).to_list(1000)
-    gps_data = await db["gps"].find({}, {"_id": 0}).to_list(1000)
-    vlogs_meta = await db["vlogs"].find({}, {"_id": 0, "data": 0}).to_list(1000)
-
-    export_data = {
-        "sentiments": sentiments,
-        "gps_coordinates": gps_data,
-        "vlogs_metadata": vlogs_meta
-    }
+    # 1. 準備資料
+    # 撈出所有 Mood (主表)
+    sentiments = await db["sentiments"].find().sort("timestamp", -1).to_list(1000)
     
-    return JSONResponse(
-        content=json.loads(dumps(export_data)), 
-        headers={"Content-Disposition": "attachment; filename=emogo_full_data.json"}
+    # 建立 GPS 對照表 (加速查詢)
+    all_gps = await db["gps"].find().to_list(1000)
+    gps_map = {str(g["_id"]): g for g in all_gps}
+
+    # 建立 Vlog 對照表
+    # 因為你是用簡單的 vlogs collection 存的，所以我們直接撈這裡
+    all_vlogs = await db["vlogs"].find({}, {"data": 0}).to_list(1000) # data:0 代表不撈影片內容，只撈資訊，避免記憶體爆掉
+    vlog_map = {}
+    for v in all_vlogs:
+        if "scale_id" in v:
+            vlog_map[str(v["scale_id"])] = v
+
+    # 2. 建立 CSV 內容
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # 寫入標頭
+    writer.writerow(["Timestamp", "Slot", "Mood_Score", "Latitude", "Longitude", "Vlog_Filename", "Duration", "Vlog_Download_Link"])
+
+    # 寫入資料列
+    base_url = "https://emogo-backend-chen-hua-chang.onrender.com" # 你的後端網址前綴
+
+    for s in sentiments:
+        s_id = str(s["_id"])
+        
+        # 找 GPS
+        lat = "N/A"
+        lng = "N/A"
+        if "gps_id" in s and s["gps_id"] in gps_map:
+            g = gps_map[s["gps_id"]]
+            lat = g.get("latitude", "")
+            lng = g.get("longitude", "")
+            
+        # 找 Vlog
+        v_filename = "No Video"
+        duration = ""
+        download_link = ""
+        
+        if s_id in vlog_map:
+            v = vlog_map[s_id]
+            v_filename = v.get("filename", "")
+            duration = v.get("duration", "")
+            v_id = str(v["_id"])
+            download_link = f"{base_url}/download/vlog/{v_id}"
+
+        writer.writerow([
+            s.get("timestamp", ""),
+            s.get("slot", ""),
+            s.get("score", ""),
+            lat,
+            lng,
+            v_filename,
+            duration,
+            download_link
+        ])
+
+    # 3. 回傳 CSV 檔案 (使用 utf-8-sig 支援 Excel 中文)
+    output.seek(0)
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode('utf-8-sig')), 
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=emogo_data.csv"}
     )
 
 @app.get("/download/vlog/{vlog_id}")
